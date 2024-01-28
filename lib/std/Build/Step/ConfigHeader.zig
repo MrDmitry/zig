@@ -3,13 +3,29 @@ const ConfigHeader = @This();
 const Step = std.Build.Step;
 const Allocator = std.mem.Allocator;
 
+const ConfigError = error{
+    InvalidCharacter,
+    UndefinedVariable,
+    UnusedVariable,
+};
+
+pub const ValidatorStrategyType = enum {
+    default,
+    strict,
+};
+
+pub const CMakeStyle = struct {
+    source: std.Build.LazyPath,
+    validator: ValidatorStrategyType = .default,
+};
+
 pub const Style = union(enum) {
     /// The configure format supported by autotools. It uses `#undef foo` to
     /// mark lines that can be substituted with different values.
     autoconf: std.Build.LazyPath,
     /// The configure format supported by CMake. It uses `@FOO@`, `${}` and
     /// `#cmakedefine` for template substitution.
-    cmake: std.Build.LazyPath,
+    cmake: CMakeStyle,
     /// Instead of starting with an input file, start with nothing.
     blank,
     /// Start with nothing, like blank, and output a nasm .asm file.
@@ -17,7 +33,8 @@ pub const Style = union(enum) {
 
     pub fn getPath(style: Style) ?std.Build.LazyPath {
         switch (style) {
-            .autoconf, .cmake => |s| return s,
+            .autoconf => |s| return s,
+            .cmake => |s| return s.source,
             .blank, .nasm => return null,
         }
     }
@@ -30,6 +47,76 @@ pub const Value = union(enum) {
     int: i64,
     ident: []const u8,
     string: []const u8,
+};
+
+const ValidatorStrategy = struct {
+    const Self = @This();
+
+    arena: std.heap.ArenaAllocator,
+    strategy: ValidatorStrategyType,
+    keys: ?std.StringArrayHashMapUnmanaged(void),
+
+    fn init(allocator: Allocator, strategy: ValidatorStrategyType) !Self {
+        return switch (strategy) {
+            .default => Self{
+                .arena = undefined,
+                .strategy = strategy,
+                .keys = null,
+            },
+            .strict => Self{
+                .arena = std.heap.ArenaAllocator.init(allocator),
+                .strategy = strategy,
+                .keys = try std.StringArrayHashMapUnmanaged(void).init(allocator, &[0][]const u8{}, &[0]void{}),
+            },
+        };
+    }
+
+    fn deinit(self: *Self) void {
+        switch (self.strategy) {
+            .default => {},
+            .strict => {
+                self.arena.deinit();
+            },
+        }
+        self.* = undefined;
+    }
+
+    fn checkError(self: *Self, err: ConfigError) ConfigError!void {
+        return switch (self.strategy) {
+            .default => switch (err) {
+                ConfigError.InvalidCharacter => err,
+                else => {
+                    // suppress other errors
+                },
+            },
+            .strict => err,
+        };
+    }
+
+    fn useKey(self: *Self, key: []const u8) !void {
+        switch (self.strategy) {
+            .default => {},
+            .strict => {
+                if (self.keys) |*keys| {
+                    if (!keys.contains(key)) {
+                        const key_clone = try self.arena.allocator().dupe(u8, key);
+                        try keys.put(self.arena.allocator(), key_clone, void{});
+                    }
+                }
+            },
+        }
+    }
+
+    fn usedKeys(self: *Self) ?[][]const u8 {
+        return switch (self.strategy) {
+            .default => null,
+            .strict => {
+                if (self.keys) |*keys| {
+                    return keys.keys();
+                } else unreachable;
+            },
+        };
+    }
 };
 
 step: Step,
@@ -195,9 +282,9 @@ fn make(step: *Step, prog_node: *std.Progress.Node) !void {
             const contents = try std.fs.cwd().readFileAlloc(arena, src_path, self.max_bytes);
             try render_autoconf(step, contents, &output, self.values, src_path);
         },
-        .cmake => |file_source| {
+        .cmake => |style| {
             try output.appendSlice(c_generated_line);
-            const src_path = file_source.getPath(b);
+            const src_path = style.source.getPath(b);
             const contents = try std.fs.cwd().readFileAlloc(arena, src_path, self.max_bytes);
             try render_cmake(step, contents, &output, self.values, src_path);
         },
@@ -301,8 +388,17 @@ fn render_cmake(
     values: std.StringArrayHashMap(Value),
     src_path: []const u8,
 ) !void {
+    const self = @fieldParentPtr(ConfigHeader, "step", step);
     const build = step.owner;
     const allocator = build.allocator;
+
+    const style = switch (self.style) {
+        .cmake => |c| c,
+        else => unreachable,
+    };
+
+    var validator = try ValidatorStrategy.init(allocator, style.validator);
+    defer validator.deinit();
 
     var values_copy = try values.clone();
     defer values_copy.deinit();
@@ -313,8 +409,8 @@ fn render_cmake(
     while (line_it.next()) |raw_line| : (line_index += 1) {
         const last_line = line_it.index == line_it.buffer.len;
 
-        const line = expand_variables_cmake(allocator, raw_line, values) catch |err| switch (err) {
-            error.InvalidCharacter => {
+        const line = expand_variables_cmake(allocator, &validator, raw_line, values) catch |err| switch (err) {
+            ConfigError.InvalidCharacter => {
                 try step.addError("{s}:{d}: error: invalid character in a variable name", .{
                     src_path, line_index + 1,
                 });
@@ -418,6 +514,26 @@ fn render_cmake(
         }
 
         try renderValueC(output, name, value);
+    }
+
+    if (style.validator == .strict) {
+        if (validator.usedKeys()) |used_keys| {
+            for (used_keys) |key| {
+                _ = values_copy.fetchSwapRemove(key) orelse {
+                    try step.addError("error: undefined variable: {s}", .{
+                        key,
+                    });
+                    any_errors = true;
+                };
+            }
+
+            if (values_copy.count() > 0) {
+                try step.addError("error: unused variable: {s}", .{
+                    values_copy.keys(),
+                });
+                any_errors = true;
+            }
+        }
     }
 
     if (any_errors) {
@@ -528,6 +644,7 @@ fn renderValueNasm(output: *std.ArrayList(u8), name: []const u8, value: Value) !
 
 fn expand_variables_cmake(
     allocator: Allocator,
+    validator: *ValidatorStrategy,
     contents: []const u8,
     values: std.StringArrayHashMap(Value),
 ) ![]const u8 {
@@ -560,6 +677,11 @@ fn expand_variables_cmake(
                     }
 
                     const key = contents[curr + 1 .. close_pos];
+                    if (!values.contains(key)) {
+                        try validator.checkError(ConfigError.UndefinedVariable);
+                    } else {
+                        try validator.useKey(key);
+                    }
                     const value = values.get(key) orelse .undef;
                     const missing = contents[source_offset..curr];
                     try result.appendSlice(missing);
@@ -615,6 +737,11 @@ fn expand_variables_cmake(
 
                 const key_start = open_pos.target + open_var.len;
                 const key = result.items[key_start..];
+                if (!values.contains(key)) {
+                    try validator.checkError(ConfigError.UndefinedVariable);
+                } else {
+                    try validator.useKey(key);
+                }
                 const value = values.get(key) orelse .undef;
                 result.shrinkRetainingCapacity(result.items.len - key.len - open_var.len);
                 switch (value) {
@@ -642,7 +769,7 @@ fn expand_variables_cmake(
         }
 
         if (var_stack.items.len > 0 and std.mem.indexOfScalar(u8, valid_varname_chars, contents[curr]) == null) {
-            return error.InvalidCharacter;
+            try validator.checkError(ConfigError.InvalidCharacter);
         }
     }
 
@@ -654,183 +781,230 @@ fn expand_variables_cmake(
     return result.toOwnedSlice();
 }
 
-fn testReplaceVariables(
-    allocator: Allocator,
-    contents: []const u8,
-    expected: []const u8,
-    values: std.StringArrayHashMap(Value),
-) !void {
-    const actual = try expand_variables_cmake(allocator, contents, values);
-    defer allocator.free(actual);
+const TestHarness = struct {
+    const Self = @This();
 
-    try std.testing.expectEqualStrings(expected, actual);
-}
+    allocator: Allocator,
+    validator: ValidatorStrategy,
+    values: std.StringArrayHashMap(Value),
+
+    fn init(allocator: Allocator, strategy: ValidatorStrategyType) !Self {
+        return Self{
+            .allocator = allocator,
+            .validator = try ValidatorStrategy.init(allocator, strategy),
+            .values = std.StringArrayHashMap(Value).init(allocator),
+        };
+    }
+
+    fn deinit(self: *Self) void {
+        self.validator.deinit();
+        self.values.deinit();
+    }
+
+    fn addValue(self: *Self, key: []const u8, value: Value) !void {
+        try self.values.putNoClobber(key, value);
+    }
+
+    fn expandVariables(
+        self: *Self,
+        contents: []const u8,
+        expected: []const u8,
+    ) !void {
+        const actual = try expand_variables_cmake(self.allocator, &self.validator, contents, self.values);
+        defer self.allocator.free(actual);
+
+        try std.testing.expectEqualStrings(expected, actual);
+    }
+};
 
 test "expand_variables_cmake simple cases" {
     const allocator = std.testing.allocator;
-    var values = std.StringArrayHashMap(Value).init(allocator);
-    defer values.deinit();
 
-    try values.putNoClobber("undef", .undef);
-    try values.putNoClobber("defined", .defined);
-    try values.putNoClobber("true", Value{ .boolean = true });
-    try values.putNoClobber("false", Value{ .boolean = false });
-    try values.putNoClobber("int", Value{ .int = 42 });
-    try values.putNoClobber("ident", Value{ .string = "value" });
-    try values.putNoClobber("string", Value{ .string = "text" });
+    var harness = try TestHarness.init(allocator, .default);
+    defer harness.deinit();
+
+    try harness.addValue("undef", .undef);
+    try harness.addValue("defined", .defined);
+    try harness.addValue("true", Value{ .boolean = true });
+    try harness.addValue("false", Value{ .boolean = false });
+    try harness.addValue("int", Value{ .int = 42 });
+    try harness.addValue("ident", Value{ .string = "value" });
+    try harness.addValue("string", Value{ .string = "text" });
 
     // empty strings are preserved
-    try testReplaceVariables(allocator, "", "", values);
+    try harness.expandVariables("", "");
 
     // line with misc content is preserved
-    try testReplaceVariables(allocator, "no substitution", "no substitution", values);
+    try harness.expandVariables("no substitution", "no substitution");
 
     // empty ${} wrapper is removed
-    try testReplaceVariables(allocator, "${}", "", values);
+    try harness.expandVariables("${}", "");
 
     // empty @ sigils are preserved
-    try testReplaceVariables(allocator, "@", "@", values);
-    try testReplaceVariables(allocator, "@@", "@@", values);
-    try testReplaceVariables(allocator, "@@@", "@@@", values);
-    try testReplaceVariables(allocator, "@@@@", "@@@@", values);
+    try harness.expandVariables("@", "@");
+    try harness.expandVariables("@@", "@@");
+    try harness.expandVariables("@@@", "@@@");
+    try harness.expandVariables("@@@@", "@@@@");
 
     // simple substitution
-    try testReplaceVariables(allocator, "@undef@", "", values);
-    try testReplaceVariables(allocator, "${undef}", "", values);
-    try testReplaceVariables(allocator, "@defined@", "", values);
-    try testReplaceVariables(allocator, "${defined}", "", values);
-    try testReplaceVariables(allocator, "@true@", "1", values);
-    try testReplaceVariables(allocator, "${true}", "1", values);
-    try testReplaceVariables(allocator, "@false@", "0", values);
-    try testReplaceVariables(allocator, "${false}", "0", values);
-    try testReplaceVariables(allocator, "@int@", "42", values);
-    try testReplaceVariables(allocator, "${int}", "42", values);
-    try testReplaceVariables(allocator, "@ident@", "value", values);
-    try testReplaceVariables(allocator, "${ident}", "value", values);
-    try testReplaceVariables(allocator, "@string@", "text", values);
-    try testReplaceVariables(allocator, "${string}", "text", values);
+    try harness.expandVariables("@undef@", "");
+    try harness.expandVariables("${undef}", "");
+    try harness.expandVariables("@defined@", "");
+    try harness.expandVariables("${defined}", "");
+    try harness.expandVariables("@true@", "1");
+    try harness.expandVariables("${true}", "1");
+    try harness.expandVariables("@false@", "0");
+    try harness.expandVariables("${false}", "0");
+    try harness.expandVariables("@int@", "42");
+    try harness.expandVariables("${int}", "42");
+    try harness.expandVariables("@ident@", "value");
+    try harness.expandVariables("${ident}", "value");
+    try harness.expandVariables("@string@", "text");
+    try harness.expandVariables("${string}", "text");
 
     // double packed substitution
-    try testReplaceVariables(allocator, "@string@@string@", "texttext", values);
-    try testReplaceVariables(allocator, "${string}${string}", "texttext", values);
+    try harness.expandVariables("@string@@string@", "texttext");
+    try harness.expandVariables("${string}${string}", "texttext");
 
     // triple packed substitution
-    try testReplaceVariables(allocator, "@string@@int@@string@", "text42text", values);
-    try testReplaceVariables(allocator, "@string@${int}@string@", "text42text", values);
-    try testReplaceVariables(allocator, "${string}@int@${string}", "text42text", values);
-    try testReplaceVariables(allocator, "${string}${int}${string}", "text42text", values);
+    try harness.expandVariables("@string@@int@@string@", "text42text");
+    try harness.expandVariables("@string@${int}@string@", "text42text");
+    try harness.expandVariables("${string}@int@${string}", "text42text");
+    try harness.expandVariables("${string}${int}${string}", "text42text");
 
     // double separated substitution
-    try testReplaceVariables(allocator, "@int@.@int@", "42.42", values);
-    try testReplaceVariables(allocator, "${int}.${int}", "42.42", values);
+    try harness.expandVariables("@int@.@int@", "42.42");
+    try harness.expandVariables("${int}.${int}", "42.42");
 
     // triple separated substitution
-    try testReplaceVariables(allocator, "@int@.@true@.@int@", "42.1.42", values);
-    try testReplaceVariables(allocator, "@int@.${true}.@int@", "42.1.42", values);
-    try testReplaceVariables(allocator, "${int}.@true@.${int}", "42.1.42", values);
-    try testReplaceVariables(allocator, "${int}.${true}.${int}", "42.1.42", values);
+    try harness.expandVariables("@int@.@true@.@int@", "42.1.42");
+    try harness.expandVariables("@int@.${true}.@int@", "42.1.42");
+    try harness.expandVariables("${int}.@true@.${int}", "42.1.42");
+    try harness.expandVariables("${int}.${true}.${int}", "42.1.42");
 
     // misc prefix is preserved
-    try testReplaceVariables(allocator, "false is @false@", "false is 0", values);
-    try testReplaceVariables(allocator, "false is ${false}", "false is 0", values);
+    try harness.expandVariables("false is @false@", "false is 0");
+    try harness.expandVariables("false is ${false}", "false is 0");
 
     // misc suffix is preserved
-    try testReplaceVariables(allocator, "@true@ is true", "1 is true", values);
-    try testReplaceVariables(allocator, "${true} is true", "1 is true", values);
+    try harness.expandVariables("@true@ is true", "1 is true");
+    try harness.expandVariables("${true} is true", "1 is true");
 
     // surrounding content is preserved
-    try testReplaceVariables(allocator, "what is 6*7? @int@!", "what is 6*7? 42!", values);
-    try testReplaceVariables(allocator, "what is 6*7? ${int}!", "what is 6*7? 42!", values);
+    try harness.expandVariables("what is 6*7? @int@!", "what is 6*7? 42!");
+    try harness.expandVariables("what is 6*7? ${int}!", "what is 6*7? 42!");
 
     // incomplete key is preserved
-    try testReplaceVariables(allocator, "@undef", "@undef", values);
-    try testReplaceVariables(allocator, "${undef", "${undef", values);
-    try testReplaceVariables(allocator, "{undef}", "{undef}", values);
-    try testReplaceVariables(allocator, "undef@", "undef@", values);
-    try testReplaceVariables(allocator, "undef}", "undef}", values);
+    try harness.expandVariables("@undef", "@undef");
+    try harness.expandVariables("${undef", "${undef");
+    try harness.expandVariables("{undef}", "{undef}");
+    try harness.expandVariables("undef@", "undef@");
+    try harness.expandVariables("undef}", "undef}");
 
     // unknown key is removed
-    try testReplaceVariables(allocator, "@bad@", "", values);
-    try testReplaceVariables(allocator, "${bad}", "", values);
+    try harness.expandVariables("@bad@", "");
+    try harness.expandVariables("${bad}", "");
 }
 
 test "expand_variables_cmake edge cases" {
     const allocator = std.testing.allocator;
-    var values = std.StringArrayHashMap(Value).init(allocator);
-    defer values.deinit();
+
+    var harness = try TestHarness.init(allocator, .default);
+    defer harness.deinit();
 
     // special symbols
-    try values.putNoClobber("at", Value{ .string = "@" });
-    try values.putNoClobber("dollar", Value{ .string = "$" });
-    try values.putNoClobber("underscore", Value{ .string = "_" });
+    try harness.addValue("at", Value{ .string = "@" });
+    try harness.addValue("dollar", Value{ .string = "$" });
+    try harness.addValue("underscore", Value{ .string = "_" });
 
     // basic value
-    try values.putNoClobber("string", Value{ .string = "text" });
+    try harness.addValue("string", Value{ .string = "text" });
 
     // proxy case values
-    try values.putNoClobber("string_proxy", Value{ .string = "string" });
-    try values.putNoClobber("string_at", Value{ .string = "@string@" });
-    try values.putNoClobber("string_curly", Value{ .string = "{string}" });
-    try values.putNoClobber("string_var", Value{ .string = "${string}" });
+    try harness.addValue("string_proxy", Value{ .string = "string" });
+    try harness.addValue("string_at", Value{ .string = "@string@" });
+    try harness.addValue("string_curly", Value{ .string = "{string}" });
+    try harness.addValue("string_var", Value{ .string = "${string}" });
 
     // stack case values
-    try values.putNoClobber("nest_underscore_proxy", Value{ .string = "underscore" });
-    try values.putNoClobber("nest_proxy", Value{ .string = "nest_underscore_proxy" });
+    try harness.addValue("nest_underscore_proxy", Value{ .string = "underscore" });
+    try harness.addValue("nest_proxy", Value{ .string = "nest_underscore_proxy" });
 
     // @-vars resolved only when they wrap valid characters, otherwise considered literals
-    try testReplaceVariables(allocator, "@@string@@", "@text@", values);
-    try testReplaceVariables(allocator, "@${string}@", "@text@", values);
+    try harness.expandVariables("@@string@@", "@text@");
+    try harness.expandVariables("@${string}@", "@text@");
 
     // @-vars are resolved inside ${}-vars
-    try testReplaceVariables(allocator, "${@string_proxy@}", "text", values);
+    try harness.expandVariables("${@string_proxy@}", "text");
 
     // expanded variables are considered strings after expansion
-    try testReplaceVariables(allocator, "@string_at@", "@string@", values);
-    try testReplaceVariables(allocator, "${string_at}", "@string@", values);
-    try testReplaceVariables(allocator, "$@string_curly@", "${string}", values);
-    try testReplaceVariables(allocator, "$${string_curly}", "${string}", values);
-    try testReplaceVariables(allocator, "${string_var}", "${string}", values);
-    try testReplaceVariables(allocator, "@string_var@", "${string}", values);
-    try testReplaceVariables(allocator, "${dollar}{${string}}", "${text}", values);
-    try testReplaceVariables(allocator, "@dollar@{${string}}", "${text}", values);
-    try testReplaceVariables(allocator, "@dollar@{@string@}", "${text}", values);
+    try harness.expandVariables("@string_at@", "@string@");
+    try harness.expandVariables("${string_at}", "@string@");
+    try harness.expandVariables("$@string_curly@", "${string}");
+    try harness.expandVariables("$${string_curly}", "${string}");
+    try harness.expandVariables("${string_var}", "${string}");
+    try harness.expandVariables("@string_var@", "${string}");
+    try harness.expandVariables("${dollar}{${string}}", "${text}");
+    try harness.expandVariables("@dollar@{${string}}", "${text}");
+    try harness.expandVariables("@dollar@{@string@}", "${text}");
 
     // when expanded variables contain invalid characters, they prevent further expansion
-    try testReplaceVariables(allocator, "${${string_var}}", "", values);
-    try testReplaceVariables(allocator, "${@string_var@}", "", values);
+    try harness.expandVariables("${${string_var}}", "");
+    try harness.expandVariables("${@string_var@}", "");
 
     // nested expanded variables are expanded from the inside out
-    try testReplaceVariables(allocator, "${string${underscore}proxy}", "string", values);
-    try testReplaceVariables(allocator, "${string@underscore@proxy}", "string", values);
+    try harness.expandVariables("${string${underscore}proxy}", "string");
+    try harness.expandVariables("${string@underscore@proxy}", "string");
 
     // nested vars are only expanded when ${} is closed
-    try testReplaceVariables(allocator, "@nest@underscore@proxy@", "underscore", values);
-    try testReplaceVariables(allocator, "${nest${underscore}proxy}", "nest_underscore_proxy", values);
-    try testReplaceVariables(allocator, "@nest@@nest_underscore@underscore@proxy@@proxy@", "underscore", values);
-    try testReplaceVariables(allocator, "${nest${${nest_underscore${underscore}proxy}}proxy}", "nest_underscore_proxy", values);
+    try harness.expandVariables("@nest@underscore@proxy@", "underscore");
+    try harness.expandVariables("${nest${underscore}proxy}", "nest_underscore_proxy");
+    try harness.expandVariables("@nest@@nest_underscore@underscore@proxy@@proxy@", "underscore");
+    try harness.expandVariables("${nest${${nest_underscore${underscore}proxy}}proxy}", "nest_underscore_proxy");
 
     // invalid characters lead to an error
-    try std.testing.expectError(error.InvalidCharacter, testReplaceVariables(allocator, "${str*ing}", "", values));
-    try std.testing.expectError(error.InvalidCharacter, testReplaceVariables(allocator, "${str$ing}", "", values));
-    try std.testing.expectError(error.InvalidCharacter, testReplaceVariables(allocator, "${str@ing}", "", values));
+    try std.testing.expectError(ConfigError.InvalidCharacter, harness.expandVariables("${str*ing}", ""));
+    try std.testing.expectError(ConfigError.InvalidCharacter, harness.expandVariables("${str$ing}", ""));
+    try std.testing.expectError(ConfigError.InvalidCharacter, harness.expandVariables("${str@ing}", ""));
 }
 
 test "expand_variables_cmake escaped characters" {
     const allocator = std.testing.allocator;
-    var values = std.StringArrayHashMap(Value).init(allocator);
-    defer values.deinit();
+    var harness = try TestHarness.init(allocator, .default);
+    defer harness.deinit();
 
-    try values.putNoClobber("string", Value{ .string = "text" });
+    try harness.addValue("string", Value{ .string = "text" });
 
     // backslash is an invalid character for @ lookup
-    try testReplaceVariables(allocator, "\\@string\\@", "\\@string\\@", values);
+    try harness.expandVariables("\\@string\\@", "\\@string\\@");
 
     // backslash is preserved, but doesn't affect ${} variable expansion
-    try testReplaceVariables(allocator, "\\${string}", "\\text", values);
+    try harness.expandVariables("\\${string}", "\\text");
 
     // backslash breaks ${} opening bracket identification
-    try testReplaceVariables(allocator, "$\\{string}", "$\\{string}", values);
+    try harness.expandVariables("$\\{string}", "$\\{string}");
 
     // backslash is skipped when checking for invalid characters, yet it mangles the key
-    try testReplaceVariables(allocator, "${string\\}", "", values);
+    try harness.expandVariables("${string\\}", "");
+}
+
+test "expand_variables_cmake strict validator" {
+    const allocator = std.testing.allocator;
+
+    var harness = try TestHarness.init(allocator, .strict);
+    defer harness.deinit();
+
+    try harness.addValue("string", Value{ .string = "text" });
+
+    // normal substitution works
+    try harness.expandVariables("${string}", "text");
+
+    // invalid character leads to an error
+    try std.testing.expectError(ConfigError.InvalidCharacter, harness.expandVariables("${str!ng}", ""));
+
+    // mangled key in @-capture is not considered an error, but a literal
+    try harness.expandVariables("\\@string\\@", "\\@string\\@");
+
+    // mangled key leads to an error
+    try std.testing.expectError(ConfigError.UndefinedVariable, harness.expandVariables("${string\\}", ""));
 }
