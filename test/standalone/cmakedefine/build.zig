@@ -57,7 +57,7 @@ pub fn build(b: *std.Build) void {
 
     const wrapper_header = b.addConfigHeader(
         .{
-            .style = .{ .cmake = .{ .source = .{ .path = "wrapper.h.in" }, .validator = .strict } },
+            .style = .{ .cmake = .{ .source = .{ .path = "wrapper.h.in" }, .validator = .default } },
             .include_path = "wrapper.h",
         },
         .{

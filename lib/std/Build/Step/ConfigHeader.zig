@@ -9,14 +9,14 @@ const ConfigError = error{
     UnusedVariable,
 };
 
-pub const ValidatorStrategyType = enum {
+pub const ValidatorType = enum {
     default,
     strict,
 };
 
 pub const CMakeStyle = struct {
     source: std.Build.LazyPath,
-    validator: ValidatorStrategyType = .default,
+    validator: ValidatorType = .default,
 };
 
 pub const Style = union(enum) {
@@ -52,70 +52,85 @@ pub const Value = union(enum) {
 const ValidatorStrategy = struct {
     const Self = @This();
 
-    arena: std.heap.ArenaAllocator,
-    strategy: ValidatorStrategyType,
+    arena: ?std.heap.ArenaAllocator,
     keys: ?std.StringArrayHashMapUnmanaged(void),
 
-    fn init(allocator: Allocator, strategy: ValidatorStrategyType) !Self {
+    checkErrorFn: *const fn (err: ConfigError) ConfigError!void,
+    useKeyFn: *const fn (self: *Self, key: []const u8) anyerror!void,
+    usedKeysFn: *const fn (self: *Self) ?[][]const u8,
+
+    fn init(allocator: Allocator, strategy: ValidatorType) !Self {
         return switch (strategy) {
             .default => Self{
-                .arena = undefined,
-                .strategy = strategy,
+                .arena = null,
                 .keys = null,
+                .checkErrorFn = &checkErrorDefault,
+                .useKeyFn = &useKeyDefault,
+                .usedKeysFn = &usedKeysDefault,
             },
             .strict => Self{
                 .arena = std.heap.ArenaAllocator.init(allocator),
-                .strategy = strategy,
                 .keys = try std.StringArrayHashMapUnmanaged(void).init(allocator, &[0][]const u8{}, &[0]void{}),
+                .checkErrorFn = &checkErrorStrict,
+                .useKeyFn = &useKeyStrict,
+                .usedKeysFn = &usedKeysStrict,
             },
         };
     }
 
     fn deinit(self: *Self) void {
-        switch (self.strategy) {
-            .default => {},
-            .strict => {
-                self.arena.deinit();
-            },
+        if (self.arena) |arena| {
+            arena.deinit();
         }
         self.* = undefined;
     }
 
     fn checkError(self: *Self, err: ConfigError) ConfigError!void {
-        return switch (self.strategy) {
-            .default => switch (err) {
-                ConfigError.InvalidCharacter => err,
-                else => {
-                    // suppress other errors
-                },
-            },
-            .strict => err,
-        };
+        return self.checkErrorFn(err);
     }
 
     fn useKey(self: *Self, key: []const u8) !void {
-        switch (self.strategy) {
-            .default => {},
-            .strict => {
-                if (self.keys) |*keys| {
-                    if (!keys.contains(key)) {
-                        const key_clone = try self.arena.allocator().dupe(u8, key);
-                        try keys.put(self.arena.allocator(), key_clone, void{});
-                    }
-                }
-            },
-        }
+        return self.useKeyFn(self, key);
     }
 
     fn usedKeys(self: *Self) ?[][]const u8 {
-        return switch (self.strategy) {
-            .default => null,
-            .strict => {
-                if (self.keys) |*keys| {
-                    return keys.keys();
-                } else unreachable;
+        return self.usedKeysFn(self);
+    }
+
+    fn checkErrorDefault(err: ConfigError) ConfigError!void {
+        return switch (err) {
+            ConfigError.InvalidCharacter => err,
+            else => {
+                // suppress other errors
             },
         };
+    }
+
+    fn checkErrorStrict(err: ConfigError) ConfigError!void {
+        return err;
+    }
+
+    fn useKeyDefault(self: *Self, key: []const u8) !void {
+        _ = self;
+        _ = key;
+    }
+
+    fn useKeyStrict(self: *Self, key: []const u8) !void {
+        if (self.keys) |*keys| {
+            if (!keys.contains(key)) {
+                const key_clone = try self.arena.?.allocator().dupe(u8, key);
+                try keys.put(self.arena.?.allocator(), key_clone, void{});
+            }
+        }
+    }
+
+    fn usedKeysDefault(self: *Self) ?[][]const u8 {
+        _ = self;
+        return null;
+    }
+
+    fn usedKeysStrict(self: *Self) ?[][]const u8 {
+        return self.keys.?.keys();
     }
 };
 
@@ -788,7 +803,7 @@ const TestHarness = struct {
     validator: ValidatorStrategy,
     values: std.StringArrayHashMap(Value),
 
-    fn init(allocator: Allocator, strategy: ValidatorStrategyType) !Self {
+    fn init(allocator: Allocator, strategy: ValidatorType) !Self {
         return Self{
             .allocator = allocator,
             .validator = try ValidatorStrategy.init(allocator, strategy),
